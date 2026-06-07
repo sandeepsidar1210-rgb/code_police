@@ -1,0 +1,84 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Users collection - server-side only (Admin SDK bypasses rules)
+    match /users/{userId} {
+      allow read, write: if false;
+    }
+
+    // Projects collection - server-side only
+    match /projects/{projectId} {
+      allow read, write: if false;
+    }
+
+    // Analysis runs and their issues subcollection - server-side only
+    match /analysis_runs/{runId} {
+      allow read, write: if false;
+
+      match /issues/{issueId} {
+        allow read, write: if false;
+      }
+    }
+
+    // Notifications - server-side only
+    match /notifications/{notificationId} {
+      allow read, write: if false;
+    }
+
+    // Pitch decks - server-side only
+    match /pitch-decks/{deckId} {
+      allow read, write: if false;
+    }
+
+    // Equity projects - server-side only
+    match /equity_projects/{projectId} {
+      allow read, write: if false;
+    }
+
+    // Equity transactions - server-side only
+    match /equity_transactions/{transactionId} {
+      allow read, write: if false;
+    }
+
+    // Database connections - server-side only
+    match /database_connections/{connectionId} {
+      allow read, write: if false;
+    }
+
+    // Database conversations and messages subcollection - server-side only
+    match /db_conversations/{conversationId} {
+      allow read, write: if false;
+
+      match /messages/{messageId} {
+        allow read, write: if false;
+      }
+    }
+
+    // Analytics cache - server-side only
+    match /analytics_cache/{cacheId} {
+      allow read, write: if false;
+    }
+
+    // AI insights cache - server-side only
+    match /ai_insights_cache/{cacheId} {
+      allow read, write: if false;
+    }
+
+    // Token usage - server-side only
+    match /token_usage/{usageId} {
+      allow read, write: if false;
+    }
+
+    // Health check collection - server-side only
+    match /_health/{docId} {
+      allow read, write: if false;
+    }
+
+    // Deny all other access by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
