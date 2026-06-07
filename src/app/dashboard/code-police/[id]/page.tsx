@@ -108,6 +108,7 @@ export default function ProjectDetailPage({ params }: { params: Promise<{ id: st
   const [error, setError] = useState("");
   const [isLoadingIssues, setIsLoadingIssues] = useState<string | null>(null);
   const [isCreatingPR, setIsCreatingPR] = useState<string | null>(null);
+  const [isSimulating, setIsSimulating] = useState(false);
 
   // Fetch project and analysis runs
   const fetchData = async (showRefresh = false) => {
@@ -229,7 +230,23 @@ export default function ProjectDetailPage({ params }: { params: Promise<{ id: st
       setIsAnalyzing(false);
     }
   };
-
+  // Simulate a PR Webhook
+  const simulatePR = async () => {
+    if (!project) return;
+    setIsSimulating(true);
+    try {
+      const res = await fetch(`/api/code-police/projects/${project.id}/demo-pr`, {
+        method: 'POST',
+      });
+      if (!res.ok) throw new Error("Failed to simulate PR");
+      await fetchData(true);
+    } catch (err) {
+      console.error(err);
+      alert("Failed to simulate PR webhook");
+    } finally {
+      setIsSimulating(false);
+    }
+  };
   // Fetch issues for a specific run
   const fetchIssuesForRun = async (runId: string) => {
     if (issues[runId]) return; // Already loaded
@@ -441,6 +458,14 @@ export default function ProjectDetailPage({ params }: { params: Promise<{ id: st
               <BarChart3 className="w-4 h-4" />
               Analytics
             </Link>
+            <button
+              onClick={simulatePR}
+              disabled={isSimulating || project.status !== 'active'}
+              className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg transition-colors disabled:opacity-50"
+            >
+              {isSimulating ? <Loader2 className="w-4 h-4 animate-spin" /> : <GitPullRequest className="w-4 h-4" />}
+              Demo PR Impact
+            </button>
             <button
               onClick={runAnalysis}
               disabled={isAnalyzing || project.status !== 'active'}

@@ -124,7 +124,7 @@ export default function DashboardPage() {
           <div className="h-px flex-1 ml-4 bg-gradient-to-r from-zinc-800 to-transparent" />
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
           {/* ─── CODE POLICE CARD ─── */}
           <Link href="/dashboard/code-police" className="group">
             <div className="relative glass rounded-2xl p-6 transition-all duration-300 hover:scale-[1.01] overflow-hidden border border-white/5 hover:border-violet-500/20">
@@ -250,6 +250,63 @@ export default function DashboardPage() {
                 </code>
                 <span className="text-[10px] text-zinc-600">•</span>
                 <span className="text-[10px] text-zinc-500">Sandbox execution</span>
+              </div>
+            </div>
+          </Link>
+
+          {/* ─── OPEN SOURCE MAINTAINER CARD ─── */}
+          <Link href="/dashboard/code-police" className="group">
+            <div className="relative glass rounded-2xl p-6 transition-all duration-300 hover:scale-[1.01] overflow-hidden border border-white/5 hover:border-blue-500/20 h-full">
+              {/* Top accent */}
+              <div className="absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r from-transparent via-blue-500/60 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+
+              <div className="flex items-start justify-between mb-5">
+                <div className="flex items-center gap-3">
+                  <div className="p-3 rounded-xl bg-blue-500/10 group-hover:bg-blue-500/20 transition-colors">
+                    <Globe className="w-6 h-6 text-blue-400" />
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-bold text-zinc-100 group-hover:text-white transition-colors">
+                      Open Source tools
+                    </h3>
+                    <div className="flex items-center gap-1.5 mt-1">
+                      <Lock className="w-3 h-3 text-zinc-500" />
+                      <span className="text-[10px] text-zinc-500 uppercase tracking-wider">
+                        Maintainer Dashboard
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                <ArrowRight className="w-5 h-5 text-blue-400 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all duration-300 mt-1" />
+              </div>
+
+              <p className="text-sm text-zinc-400 leading-relaxed mb-5">
+                Powerful tools for OSS maintainers. See a <span className="text-zinc-200 font-medium">dependency blast-radius graph</span> on PRs, pre-check for merge conflicts, and allow the community to use <span className="text-zinc-200 font-medium">BYOK</span> (Bring Your Own Key) to save costs.
+              </p>
+
+              <div className="grid grid-cols-3 gap-3">
+                <div className="bg-white/[0.03] rounded-lg p-3 text-center">
+                  <Activity className="w-4 h-4 text-blue-400 mx-auto mb-1" />
+                  <span className="text-[10px] text-zinc-500 block">Dependency</span>
+                  <span className="text-xs text-zinc-300 font-medium">Graph</span>
+                </div>
+                <div className="bg-white/[0.03] rounded-lg p-3 text-center">
+                  <GitBranch className="w-4 h-4 text-blue-400 mx-auto mb-1" />
+                  <span className="text-[10px] text-zinc-500 block">Conflict</span>
+                  <span className="text-xs text-zinc-300 font-medium">Pre-check</span>
+                </div>
+                <div className="bg-white/[0.03] rounded-lg p-3 text-center">
+                  <Lock className="w-4 h-4 text-blue-400 mx-auto mb-1" />
+                  <span className="text-[10px] text-zinc-500 block">BYOK</span>
+                  <span className="text-xs text-zinc-300 font-medium">Support</span>
+                </div>
+              </div>
+
+              {/* Action bar */}
+              <div className="flex items-center gap-3 mt-4 pt-4 border-t border-white/5">
+                <span className="text-[10px] text-blue-400/70 bg-blue-500/5 px-2 py-1 rounded-md font-mono">
+                  Available in Code Police
+                </span>
               </div>
             </div>
           </Link>
