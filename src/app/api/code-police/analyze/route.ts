@@ -6,6 +6,7 @@ import {
   detectLanguage,
   generateAnalysisSummary,
 } from "@/lib/agents/code-police/analyzer";
+import { sendAnalysisProgress } from "@/lib/agents/code-police/websocket";
 import { sendAnalysisReport } from "@/lib/agents/code-police/email";
 import { fetchCommit, fetchFileContent } from "@/lib/agents/code-police/github";
 import { getUserEmail } from "@/lib/utils/clerk";
@@ -33,6 +34,7 @@ const sanitizeForFirestore = <T extends Record<string, unknown>>(obj: T): T => {
 };
 
 export async function POST(request: NextRequest) {
+  let projectId: string | undefined = undefined;
   try {
     const { userId } = await auth();
 
@@ -42,13 +44,14 @@ export async function POST(request: NextRequest) {
 
     const body = await request.json();
     const {
-      projectId,
+      projectId: bodyProjectId,
       owner,
       repo,
       commitSha,
       sendEmail = false,
       recipientEmail,
     } = body;
+    projectId = bodyProjectId;
 
     if (!projectId || !owner || !repo) {
       return NextResponse.json(
@@ -126,11 +129,22 @@ export async function POST(request: NextRequest) {
       createdAt: now,
     });
 
+    sendAnalysisProgress(projectId, {
+      status: "Initializing analysis...",
+      progress: 0,
+      details: "Created analysis run record",
+    });
+
     // Fetch commit details - if no SHA provided, get latest commit
     let commit;
     let actualCommitSha = commitSha;
 
     if (!commitSha || commitSha === "latest") {
+      sendAnalysisProgress(projectId, {
+        status: "Fetching repository details...",
+        progress: 5,
+        details: "Determining latest commit SHA",
+      });
       console.log("[Analyze] No commit SHA provided, fetching latest commit from main branch...");
       // Fetch the list of commits to get the latest SHA
       const commitsResponse = await fetch(
@@ -157,7 +171,19 @@ export async function POST(request: NextRequest) {
       console.log("[Analyze] Using latest commit:", actualCommitSha);
     }
 
+    sendAnalysisProgress(projectId, {
+      status: "Fetching commit details...",
+      progress: 10,
+      details: `Fetching commit info for ${actualCommitSha || commitSha}`,
+    });
+
     commit = await fetchCommit(githubToken, owner, repo, actualCommitSha);
+
+    sendAnalysisProgress(projectId, {
+      status: "Analyzing commit files...",
+      progress: 18,
+      details: `Commit retrieved. Processing files list.`,
+    });
 
     // ========================================================================
     // FILE FILTERING - Exclude non-source files from analysis
@@ -263,6 +289,12 @@ export async function POST(request: NextRequest) {
       console.log(`[Analyze] ⏭️ Skipped ${filesSkippedByFilter} files (removed/excluded)`);
     }
 
+    sendAnalysisProgress(projectId, {
+      status: "Preparing files...",
+      progress: 22,
+      details: `Found ${filesToProcess.length} analyzable files out of ${commitFiles.length} changed.`,
+    });
+
     // Import cache utilities
     const { generateCacheKey, getCachedAnalysis, setCachedAnalysis, processBatch } = await import(
       "@/lib/agents/code-police/analysis-cache"
@@ -273,6 +305,12 @@ export async function POST(request: NextRequest) {
     const { results, errors } = await processBatch(
       filesToProcess,
       async (file) => {
+        sendAnalysisProgress(projectId!, {
+          status: `Analyzing: ${file.filename}`,
+          progress: 25,
+          details: `Processing file content and running AI reviewer`,
+        });
+
         // Get file content
         const content = await fetchFileContent(
           token,
@@ -330,6 +368,12 @@ export async function POST(request: NextRequest) {
       CONCURRENCY,
       (batchNum, totalBatches) => {
         console.log(`[Analyze] ⚡ Batch ${batchNum}/${totalBatches} complete`);
+        const percent = 30 + Math.round((batchNum / totalBatches) * 50);
+        sendAnalysisProgress(projectId!, {
+          status: `Analyzing files (Batch ${batchNum}/${totalBatches})...`,
+          progress: percent,
+          details: `Completed batch ${batchNum} of ${totalBatches}`,
+        });
       }
     );
 
@@ -372,7 +416,7 @@ export async function POST(request: NextRequest) {
       ...issue,
       id: `${analysisRef.id}-${idx}`,
       analysisRunId: analysisRef.id,
-      projectId,
+      projectId: projectId!,
       isMuted: false,
     }));
 
@@ -384,6 +428,12 @@ export async function POST(request: NextRequest) {
     }
 
     // Generate summary
+    sendAnalysisProgress(projectId, {
+      status: "Generating summary...",
+      progress: 85,
+      details: "Generating AI review summary",
+    });
+
     const summary = await generateAnalysisSummary({
       repoName: `${owner}/${repo}`,
       commitSha: actualCommitSha,
@@ -392,6 +442,12 @@ export async function POST(request: NextRequest) {
     });
 
     // Update analysis run with results
+    sendAnalysisProgress(projectId, {
+      status: "Saving results...",
+      progress: 90,
+      details: `Saving ${fullIssues.length} issues to database`,
+    });
+
     batch.update(analysisRef, {
       status: "completed",
       completedAt: new Date(),
@@ -421,6 +477,12 @@ export async function POST(request: NextRequest) {
         if (!emailTo) {
           console.warn("No email address available for notification");
         } else {
+          sendAnalysisProgress(projectId, {
+            status: "Sending notifications...",
+            progress: 95,
+            details: `Sending email report to ${emailTo}`,
+          });
+
           await sendAnalysisReport({
             to: emailTo,
             run: {
@@ -451,6 +513,12 @@ export async function POST(request: NextRequest) {
       updatedAt: new Date(),
     });
 
+    sendAnalysisProgress(projectId, {
+      status: "Analysis complete!",
+      progress: 100,
+      details: `Analysis finished successfully. Found ${fullIssues.length} issues.`,
+    });
+
     return NextResponse.json({
       success: true,
       analysisId: analysisRef.id,
@@ -463,6 +531,15 @@ export async function POST(request: NextRequest) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
     const errorStack = error instanceof Error ? error.stack : undefined;
     console.error("[Analyze] Stack:", errorStack);
+
+    // Try to broadcast the error
+    if (projectId) {
+      sendAnalysisProgress(projectId, {
+        status: "Analysis failed",
+        progress: 100,
+        details: `Error: ${errorMessage}`,
+      });
+    }
 
     return NextResponse.json(
       {

@@ -6,6 +6,7 @@ import {
   detectLanguage,
   generateAnalysisSummary,
 } from "@/lib/agents/code-police/analyzer";
+import { sendAnalysisProgress } from "@/lib/agents/code-police/websocket";
 import { sendAnalysisReport } from "@/lib/agents/code-police/email";
 import { generateAndCreateFixPR } from "@/lib/agents/code-police/auto-fix";
 import { fetchCommit, fetchFileContent, postPRComment, formatPRComment, getDependentFiles } from "@/lib/agents/code-police/github";
@@ -306,12 +307,29 @@ async function handlePushEvent(
     createdAt: new Date(),
   });
 
+  sendAnalysisProgress(project.id, {
+    status: "Initializing webhook analysis...",
+    progress: 0,
+    details: `Created analysis run ${analysisRef.id} for branch ${branch}`,
+  });
 
   try {
+    sendAnalysisProgress(project.id, {
+      status: "Fetching commit details...",
+      progress: 10,
+      details: `Fetching commit info for ${commitSha.slice(0, 7)}`,
+    });
+
     console.log("[Push Event] Fetching commit details...");
     // Fetch commit and analyze
     const commit = await fetchCommit(githubToken, owner, repo, commitSha);
     const commitFiles = commit.files || [];
+
+    sendAnalysisProgress(project.id, {
+      status: "Analyzing commit files...",
+      progress: 18,
+      details: `Retrieved commit. Parsing ${commitFiles.length} files.`,
+    });
     console.log("[Push Event] Commit has", commitFiles.length, "files changed");
 
     // ========================================================================
@@ -352,7 +370,6 @@ async function handlePushEvent(
     const analyzedFiles: string[] = [];
     const skippedFiles: string[] = [];
 
-    // Get custom rules from project settings
     const customRules = (project.customRules as string[] | undefined) || [];
 
     // Resolve BYOK key (project-level, then platform default).
@@ -361,6 +378,15 @@ async function handlePushEvent(
     });
     console.log(`[Push Event] Using ${keySource} API key`);
 
+    const analyzableFiles = commitFiles.filter(file => file.status !== "removed" && shouldAnalyzeFile(file.filename));
+    
+    sendAnalysisProgress(project.id, {
+      status: "Filtering files...",
+      progress: 22,
+      details: `Found ${analyzableFiles.length} files to analyze.`,
+    });
+
+    let analyzedCount = 0;
     for (const file of commitFiles) {
       if (file.status === "removed") {
         console.log("[Push Event] Skipping removed file:", file.filename);
@@ -373,6 +399,15 @@ async function handlePushEvent(
         skippedFiles.push(file.filename);
         continue;
       }
+
+      analyzedCount++;
+      const currentPercent = 25 + Math.round((analyzedCount / Math.max(1, analyzableFiles.length)) * 55); // Scales from 25% to 80%
+
+      sendAnalysisProgress(project.id, {
+        status: `Analyzing: ${file.filename}`,
+        progress: currentPercent,
+        details: `Analyzing file ${analyzedCount} of ${analyzableFiles.length}`,
+      });
 
       console.log("[Push Event] Analyzing file:", file.filename);
 
@@ -459,6 +494,12 @@ async function handlePushEvent(
 
     // Store in SUBCOLLECTION: analysis_runs/{runId}/issues
     if (fullIssues.length > 0) {
+      sendAnalysisProgress(project.id, {
+        status: "Saving results...",
+        progress: 90,
+        details: `Writing ${fullIssues.length} issues to database`,
+      });
+
       const issuesBatch = adminDb.batch();
       for (const issue of fullIssues) {
         // FIX: Store in subcollection, not top-level collection
@@ -477,6 +518,12 @@ async function handlePushEvent(
     }
 
     // Generate summary
+    sendAnalysisProgress(project.id, {
+      status: "Generating summary...",
+      progress: 92,
+      details: "Generating AI review summary",
+    });
+
     const summary = await generateAnalysisSummary({
       repoName: `${owner}/${repo}`,
       commitSha,
@@ -524,6 +571,12 @@ async function handlePushEvent(
         console.warn("[Push Event] No email recipients found, skipping email");
       }
 
+      sendAnalysisProgress(project.id, {
+        status: "Sending notifications...",
+        progress: 95,
+        details: "Sending email reports to configured recipients",
+      });
+
       for (const email of recipients) {
         console.log("[Push Event] Sending email to:", email);
         const emailResult = await sendAnalysisReport({
@@ -565,6 +618,12 @@ async function handlePushEvent(
 
     // Auto-fix: Generate fixes and create PR if enabled
     if ((project.autoFixEnabled as boolean | undefined) && fullIssues.length > 0) {
+      sendAnalysisProgress(project.id, {
+        status: "Running Auto-fix...",
+        progress: 98,
+        details: "Generating automatic PR fixes for detected issues",
+      });
+
       console.log("[Push Event] Auto-fix enabled, generating fixes...");
 
       try {
@@ -615,8 +674,21 @@ async function handlePushEvent(
         });
       }
     }
+
+    sendAnalysisProgress(project.id, {
+      status: "Analysis complete!",
+      progress: 100,
+      details: `Analysis finished successfully. Found ${fullIssues.length} issues.`,
+    });
   } catch (error) {
     console.error("Push event analysis failed:", error);
+    
+    sendAnalysisProgress(project.id, {
+      status: "Analysis failed",
+      progress: 100,
+      details: `Error: ${error instanceof Error ? error.message : "Webhook analysis failed"}`,
+    });
+
     await analysisRef.update({
       status: "failed",
       error: error instanceof Error ? error.message : "Analysis failed",
