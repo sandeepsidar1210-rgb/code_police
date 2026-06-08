@@ -308,7 +308,15 @@ export function resolvePythonImport(
     // ImportError ("attempted relative import beyond top-level package") there,
     // so resolving against the root would only produce spurious edges.
     const dir = dirOf(fromFile);
-    const availableDepth = dir === "" ? 0 : dir.split("/").length;
+    // Compute Python package depth relative to the deepest matching source root,
+    // so `src/pkg/sub/mod.py` has depth 2 (pkg/sub), not 3 (src/pkg/sub).
+    // Without this, src-layout files permit one extra relative-import level that
+    // Python would reject with ImportError.
+    const matchingRoot = sourceRoots
+      .filter((r) => r === "" || dir === r || dir.startsWith(r + "/"))
+      .reduce((best, r) => (r.length > best.length ? r : best), "");
+    const rootDepth = matchingRoot ? matchingRoot.split("/").length : 0;
+    const availableDepth = (dir === "" ? 0 : dir.split("/").length) - rootDepth;
     if (imp.level - 1 > availableDepth) return [];
 
     let base = dir;
@@ -321,16 +329,19 @@ export function resolvePythonImport(
   for (const baseDir of baseDirs) {
     const modPath = [baseDir, ...moduleParts].filter((s) => s !== "").join("/");
     const moduleFile = tryPyTarget(modPath, fileSet);
-    if (moduleFile) results.add(moduleFile);
-
-    // Importing `a.b.c` also executes the intermediate package __init__ files
-    // (`a/__init__.py`, `a/b/__init__.py`), so changes there affect importers.
-    let acc = baseDir;
-    for (let i = 0; i < moduleParts.length - 1; i++) {
-      acc = [acc, moduleParts[i]].filter((s) => s !== "").join("/");
-      for (const ext of PY_EXTENSIONS) {
-        const init = acc ? `${acc}/__init__${ext}` : `__init__${ext}`;
-        if (fileSet.has(init)) results.add(init);
+    if (moduleFile) {
+      results.add(moduleFile);
+      // Importing `a.b.c` also executes intermediate package __init__ files
+      // (`a/__init__.py`, `a/b/__init__.py`). Only add these edges when the
+      // module was actually resolved in this source root — an unresolved root
+      // must not contribute false initializer edges from the wrong directory.
+      let acc = baseDir;
+      for (let i = 0; i < moduleParts.length - 1; i++) {
+        acc = [acc, moduleParts[i]].filter((s) => s !== "").join("/");
+        for (const ext of PY_EXTENSIONS) {
+          const init = acc ? `${acc}/__init__${ext}` : `__init__${ext}`;
+          if (fileSet.has(init)) results.add(init);
+        }
       }
     }
 
