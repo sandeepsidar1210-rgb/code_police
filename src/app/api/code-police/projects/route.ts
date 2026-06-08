@@ -8,7 +8,7 @@ import { checkLimit, incrementUsage } from "@/lib/usage";
  * GET /api/code-police/projects
  * List all projects for the authenticated user with their latest analysis runs
  */
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
     const { userId } = await auth();
 
@@ -21,11 +21,48 @@ export async function GET() {
       return NextResponse.json({ error: "Database not configured" }, { status: 503 });
     }
 
-    const projectsSnapshot = await adminDb
-      .collection("projects")
-      .where("userId", "==", userId)
-      .orderBy("createdAt", "desc")
-      .get();
+    const searchParams = request.nextUrl.searchParams;
+    const pageStr = searchParams.get("page");
+    const limitStr = searchParams.get("limit");
+
+    let projectsSnapshot;
+    let pagination = null;
+
+    if (pageStr) {
+      const page = Math.max(1, parseInt(pageStr, 10) || 1);
+      const limit = Math.max(1, parseInt(limitStr || "5", 10) || 5);
+      const offset = (page - 1) * limit;
+
+      const totalSnapshot = await adminDb
+        .collection("projects")
+        .where("userId", "==", userId)
+        .count()
+        .get();
+
+      const total = totalSnapshot.data().count;
+      const totalPages = Math.ceil(total / limit);
+
+      projectsSnapshot = await adminDb
+        .collection("projects")
+        .where("userId", "==", userId)
+        .orderBy("createdAt", "desc")
+        .limit(limit)
+        .offset(offset)
+        .get();
+
+      pagination = {
+        total,
+        page,
+        limit,
+        totalPages,
+      };
+    } else {
+      projectsSnapshot = await adminDb
+        .collection("projects")
+        .where("userId", "==", userId)
+        .orderBy("createdAt", "desc")
+        .get();
+    }
 
     const projects = projectsSnapshot.docs.map((doc) => {
       const data = doc.data();
@@ -69,7 +106,7 @@ export async function GET() {
       })
     );
 
-    return NextResponse.json({ projects: projectsWithRuns });
+    return NextResponse.json({ projects: projectsWithRuns, pagination });
   } catch (error) {
     console.error("Error fetching projects:", error);
     return NextResponse.json(
