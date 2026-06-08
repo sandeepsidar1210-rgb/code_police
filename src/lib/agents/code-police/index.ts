@@ -11,3 +11,4 @@ export * from "./dependency-graph";
 export * from "./conflict-detector";
 export * from "./byok";
 export * from "./pr-impact";
+export * from "./websocket";
