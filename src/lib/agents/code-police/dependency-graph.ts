@@ -187,13 +187,55 @@ export interface PythonImport {
  * multi-line parenthesized `from X import (...)` still captures the module X
  * correctly even if the individual names span lines).
  */
+/**
+ * Collapse line-continuations in import statements so multi-line parenthesized
+ * `from X import (a, b, c)` blocks and backslash-continued imports are parsed
+ * as a single logical line. Only import statements are joined; every other
+ * source line passes through unchanged.
+ */
+function joinImportContinuations(source: string): string {
+  const lines = source.split("\n");
+  const out: string[] = [];
+  let buf: string | null = null;
+  let parenDepth = 0;
+
+  const netParens = (s: string) =>
+    (s.match(/\(/g) || []).length - (s.match(/\)/g) || []).length;
+
+  for (const line of lines) {
+    if (buf === null) {
+      const isImportStmt = /^[ \t]*(from[ \t].*[ \t]import|import)[ \t]/.test(line);
+      const depth = netParens(line);
+      const backslash = /\\[ \t]*$/.test(line);
+      if (isImportStmt && (depth > 0 || backslash)) {
+        buf = line.replace(/\\[ \t]*$/, " ");
+        parenDepth = Math.max(0, depth);
+        continue;
+      }
+      out.push(line);
+    } else {
+      parenDepth += netParens(line);
+      const backslash = /\\[ \t]*$/.test(line);
+      buf += " " + line.replace(/\\[ \t]*$/, " ");
+      if (parenDepth <= 0 && !backslash) {
+        out.push(buf);
+        buf = null;
+        parenDepth = 0;
+      }
+    }
+  }
+  if (buf !== null) out.push(buf);
+  return out.join("\n");
+}
+
 export function extractPythonImports(source: string): PythonImport[] {
   const imports: PythonImport[] = [];
+  const text = joinImportContinuations(source);
 
   // `from [dots][module] import names`
   const fromRe = /^[ \t]*from[ \t]+(\.*)([A-Za-z0-9_.]*)[ \t]+import[ \t]+(.*)$/gm;
   let m: RegExpExecArray | null;
-  while ((m = fromRe.exec(source)) !== null) {
+  while ((m = fromRe.exec(text)) !== null) {
     const level = m[1].length;
     const moduleName = m[2] ?? "";
     if (level === 0 && moduleName === "") continue; // `from  import x` is invalid
@@ -202,7 +244,7 @@ export function extractPythonImports(source: string): PythonImport[] {
 
   // `import a.b, c as d`
   const importRe = /^[ \t]*import[ \t]+(.+)$/gm;
-  while ((m = importRe.exec(source)) !== null) {
+  while ((m = importRe.exec(text)) !== null) {
     let clause = m[1];
     const hash = clause.indexOf("#");
     if (hash >= 0) clause = clause.slice(0, hash);
@@ -262,7 +304,22 @@ export function resolvePythonImport(
   let baseDirs: string[];
   if (imp.level > 0) {
     // Relative import. One dot = the package directory containing `fromFile`.
-    let base = dirOf(fromFile);
+    // Reject imports that climb above the project root — Python raises
+    // ImportError ("attempted relative import beyond top-level package") there,
+    // so resolving against the root would only produce spurious edges.
+    const dir = dirOf(fromFile);
+    // Compute Python package depth relative to the deepest matching source root,
+    // so `src/pkg/sub/mod.py` has depth 2 (pkg/sub), not 3 (src/pkg/sub).
+    // Without this, src-layout files permit one extra relative-import level that
+    // Python would reject with ImportError.
+    const matchingRoot = sourceRoots
+      .filter((r) => r === "" || dir === r || dir.startsWith(r + "/"))
+      .reduce((best, r) => (r.length > best.length ? r : best), "");
+    const rootDepth = matchingRoot ? matchingRoot.split("/").length : 0;
+    const availableDepth = (dir === "" ? 0 : dir.split("/").length) - rootDepth;
+    if (imp.level - 1 > availableDepth) return [];
+
+    let base = dir;
     for (let i = 1; i < imp.level; i++) base = dirOf(base);
     baseDirs = [base];
   } else {
@@ -272,7 +329,21 @@ export function resolvePythonImport(
   for (const baseDir of baseDirs) {
     const modPath = [baseDir, ...moduleParts].filter((s) => s !== "").join("/");
     const moduleFile = tryPyTarget(modPath, fileSet);
-    if (moduleFile) results.add(moduleFile);
+    if (moduleFile) {
+      results.add(moduleFile);
+      // Importing `a.b.c` also executes intermediate package __init__ files
+      // (`a/__init__.py`, `a/b/__init__.py`). Only add these edges when the
+      // module was actually resolved in this source root — an unresolved root
+      // must not contribute false initializer edges from the wrong directory.
+      let acc = baseDir;
+      for (let i = 0; i < moduleParts.length - 1; i++) {
+        acc = [acc, moduleParts[i]].filter((s) => s !== "").join("/");
+        for (const ext of PY_EXTENSIONS) {
+          const init = acc ? `${acc}/__init__${ext}` : `__init__${ext}`;
+          if (fileSet.has(init)) results.add(init);
+        }
+      }
+    }
 
     // `from X import name` — a name may itself be a submodule (X/name.py).
     for (const name of imp.names) {
@@ -501,4 +572,106 @@ function buildMermaid(report: PrImpactReport): string {
     lines.push(`  style ${id(changed)} fill:#f97316,stroke:#fff,color:#fff`);
   }
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Cyclic dependency detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Detect circular import chains in the dependency graph.
+ *
+ * Uses a depth-first search with a recursion stack ("white/gray/black"
+ * colouring): when a node currently on the stack is reached again, the slice of
+ * the stack from that node forms a cycle. Each distinct cycle is reported once
+ * (rotations are de-duplicated) as an ordered list of file paths `[a, b, c]`
+ * meaning `a → b → c → a`.
+ *
+ * This reports a representative cycle for each circular structure it encounters
+ * rather than enumerating every elementary cycle (which is exponential in the
+ * worst case) — the right granularity for flagging circular dependencies to a
+ * maintainer. Results are deterministically ordered and capped at `maxCycles`.
+ * Traversal is bounded by the graph size (the PR-impact path caps the tree), so
+ * recursion depth stays well within limits.
+ */
+export function detectCycles(graph: DependencyGraph, maxCycles = 50): string[][] {
+  const WHITE = 0;
+  const GRAY = 1;
+  const BLACK = 2;
+  const color = new Map<string, number>();
+  for (const node of graph.nodes) color.set(node, WHITE);
+
+  const stack: string[] = [];
+  const onStack = new Set<string>();
+  const cycles: string[][] = [];
+  const seen = new Set<string>();
+
+  const neighborsOf = (node: string): string[] =>
+    [...(graph.imports.get(node) ?? new Set<string>())].sort();
+
+  const normalize = (cycle: string[]): string => {
+    let min = 0;
+    for (let i = 1; i < cycle.length; i++) {
+      if (cycle[i] < cycle[min]) min = i;
+    }
+    return [...cycle.slice(min), ...cycle.slice(0, min)].join("|");
+  };
+
+  function visit(node: string): void {
+    color.set(node, GRAY);
+    stack.push(node);
+    onStack.add(node);
+
+    for (const next of neighborsOf(node)) {
+      if (cycles.length >= maxCycles) break;
+      if (onStack.has(next)) {
+        const cycle = stack.slice(stack.indexOf(next));
+        const key = normalize(cycle);
+        if (!seen.has(key)) {
+          seen.add(key);
+          cycles.push(cycle);
+        }
+      } else if (color.get(next) === WHITE) {
+        visit(next);
+      }
+    }
+
+    stack.pop();
+    onStack.delete(node);
+    color.set(node, BLACK);
+  }
+
+  for (const node of [...graph.nodes].sort()) {
+    if (cycles.length >= maxCycles) break;
+    if (color.get(node) === WHITE) visit(node);
+  }
+
+  cycles.sort((a, b) => a.length - b.length || normalize(a).localeCompare(normalize(b)));
+  return cycles;
+}
+
+/**
+ * Render detected cycles as a Markdown section for a PR comment. Returns an
+ * empty string when there are no cycles, so callers can append it
+ * unconditionally without producing an empty heading.
+ */
+export function formatCyclesComment(cycles: string[][]): string {
+  if (cycles.length === 0) return "";
+
+  const short = (p: string) => p.split("/").slice(-2).join("/");
+  const lines = cycles.slice(0, 15).map((cycle) => {
+    const loop = [...cycle, cycle[0]].map(short).join(" → ");
+    return `- \`${loop}\``;
+  });
+  const more = cycles.length > 15 ? `\n_…and ${cycles.length - 15} more._` : "";
+
+  return [
+    "## 🔄 Circular Dependencies",
+    "",
+    `⚠️ **${cycles.length}** circular import ${cycles.length === 1 ? "chain" : "chains"} detected. ` +
+      "Circular imports can cause initialization-order bugs and make modules harder to test in isolation.",
+    "",
+    ...lines,
+    more,
+  ].join("\n");
 }

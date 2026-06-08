@@ -19,6 +19,8 @@ import {
   computePrImpact,
   formatImpactComment,
   detectSourceLanguage,
+  detectCycles,
+  formatCyclesComment,
   type PrImpactReport,
 } from "./dependency-graph";
 import {
@@ -34,6 +36,8 @@ const MAX_FILE_BYTES = 200_000;
 export interface PrImpactResult {
   impact: PrImpactReport;
   conflicts: ConflictReport | null;
+  /** Circular import chains detected in the graph (each `[a, b, c]` = a→b→c→a). */
+  cycles: string[][];
   /** Combined Markdown comment ready to post on the PR. */
   comment: string;
 }
@@ -85,6 +89,14 @@ export async function analyzePrImpact(opts: {
   const graph = buildDependencyGraph(files);
   const impact = computePrImpact(graph, changedFiles);
 
+  // 3b. Detect circular import chains. Surface the ones that involve a changed
+  //     file in the PR comment (most relevant); return the full set for the
+  //     dashboard. Swap the filter for `allCycles` to report every cycle.
+  const allCycles = detectCycles(graph);
+  const relevantCycles = allCycles.filter((cycle) =>
+    cycle.some((file) => changedFiles.includes(file))
+  );
+
   // 4. Optional conflict pre-detection.
   let conflicts: ConflictReport | null = null;
   if (opts.includeConflicts) {
@@ -95,12 +107,15 @@ export async function analyzePrImpact(opts: {
     }
   }
 
+  const cyclesComment = formatCyclesComment(relevantCycles);
+
   const comment = [
     formatImpactComment(impact),
+    cyclesComment ? "\n\n" + cyclesComment : "",
     conflicts ? "\n\n" + formatConflictComment(conflicts) : "",
   ].join("");
 
-  return { impact, conflicts, comment };
+  return { impact, conflicts, cycles: allCycles, comment };
 }
 
 async function fetchFilesBatched(
