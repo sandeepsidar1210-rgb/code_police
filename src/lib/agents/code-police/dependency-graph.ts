@@ -28,10 +28,12 @@ const PY_EXTENSIONS = [".py", ".pyi"];
 
 const GO_EXTENSIONS = [".go"];
 
-/** Every source extension whose imports this engine can parse. */
-export const SOURCE_EXTENSIONS = [...JS_TS_EXTENSIONS, ...PY_EXTENSIONS, ...GO_EXTENSIONS];
+const JAVA_EXTENSIONS = [".java"];
 
-export type SourceLanguage = "js" | "py" | "go";
+/** Every source extension whose imports this engine can parse. */
+export const SOURCE_EXTENSIONS = [...JS_TS_EXTENSIONS, ...PY_EXTENSIONS, ...GO_EXTENSIONS, ...JAVA_EXTENSIONS];
+
+export type SourceLanguage = "js" | "py" | "go" | "java";
 
 /** A single edge: `from` imports `to`. */
 export interface DependencyEdge {
@@ -77,6 +79,7 @@ export function detectSourceLanguage(path: string): SourceLanguage | null {
   if (JS_TS_EXTENSIONS.some((ext) => path.endsWith(ext))) return "js";
   if (PY_EXTENSIONS.some((ext) => path.endsWith(ext))) return "py";
   if (GO_EXTENSIONS.some((ext) => path.endsWith(ext))) return "go";
+  if (JAVA_EXTENSIONS.some((ext) => path.endsWith(ext))) return "java";
   return null;
 }
 
@@ -381,7 +384,9 @@ function stripGoComments(source: string): string {
 export function extractGoImports(source: string): string[] {
   const text = stripGoComments(source);
   const paths: string[] = [];
-  const specRe = /(?:[A-Za-z_]\w*\s+|_\s+|\.\s+)?"([^"]+)"/g;
+  // Match both double-quoted and backtick (raw string) import paths.
+  // Backtick imports are valid Go (raw_string_lit) though rare in practice.
+  const specRe = /(?:[A-Za-z_]\w*\s+|_\s+|\.\s+)?(?:"([^"]+)"|`([^`]+)`)/g;
 
   // Grouped: import ( ... )
   const groupRe = /\bimport\s*\(([\s\S]*?)\)/g;
@@ -390,13 +395,13 @@ export function extractGoImports(source: string): string[] {
     const block = gm[1];
     specRe.lastIndex = 0;
     let sm: RegExpExecArray | null;
-    while ((sm = specRe.exec(block)) !== null) paths.push(sm[1]);
+    while ((sm = specRe.exec(block)) !== null) paths.push(sm[1] ?? sm[2]);
   }
 
-  // Single-line: import [alias|_|.] "path"
-  const singleRe = /\bimport\s+(?:[A-Za-z_]\w*\s+|_\s+|\.\s+)?"([^"]+)"/g;
+  // Single-line: import [alias|_|.] "path" or `path`
+  const singleRe = /\bimport\s+(?:[A-Za-z_]\w*\s+|_\s+|\.\s+)?(?:"([^"]+)"|`([^`]+)`)/g;
   let m: RegExpExecArray | null;
-  while ((m = singleRe.exec(text)) !== null) paths.push(m[1]);
+  while ((m = singleRe.exec(text)) !== null) paths.push(m[1] ?? m[2]);
 
   return paths;
 }
@@ -439,19 +444,97 @@ export function resolveGoImport(
   goDirs: Map<string, string[]>,
   modulePath?: string
 ): string[] {
-  if (modulePath && (importPath === modulePath || importPath.startsWith(modulePath + "/"))) {
-    const rel = importPath === modulePath ? "" : importPath.slice(modulePath.length + 1);
-    return goDirs.get(rel) ?? [];
+  if (modulePath) {
+    // Module path is known: only resolve imports that start with it.
+    // Imports that don't start with it are external packages — no edge.
+    if (importPath === modulePath || importPath.startsWith(modulePath + "/")) {
+      const rel = importPath === modulePath ? "" : importPath.slice(modulePath.length + 1);
+      return goDirs.get(rel) ?? [];
+    }
+    return [];
   }
 
+  // No module path: suffix matching (best-effort). External imports that happen
+  // to share a trailing segment with an in-repo directory may produce false
+  // edges — resolved precisely only when modulePath is available.
+  // Note: root-package imports (dir "") cannot be resolved without modulePath.
   let best: string | null = null;
   for (const dir of goDirs.keys()) {
-    if (dir === "") continue;
+    if (dir === "") continue; // root package requires exact modulePath match
     if (importPath === dir || importPath.endsWith("/" + dir)) {
       if (best === null || dir.length > best.length) best = dir;
     }
   }
   return best !== null ? goDirs.get(best) ?? [] : [];
+}
+
+// ---------------------------------------------------------------------------
+// Java import support
+// ---------------------------------------------------------------------------
+
+export interface JavaImport {
+  /** Dotted fully-qualified name of the imported type (member/`*` stripped). */
+  fqn: string;
+  /** True for a package wildcard (`import a.b.*;`) → resolves to a directory. */
+  packageWildcard: boolean;
+}
+
+/**
+ * Extract Java imports. Handles ordinary type imports (`import a.b.C;`), package
+ * wildcards (`import a.b.*;`), and static imports (`import static a.b.C.m;`,
+ * `import static a.b.C.*;`). A static import targets a member of a type, so its
+ * type FQN is resolved (the trailing member or `*` is dropped). A non-static
+ * wildcard is a package import and resolves to a directory.
+ */
+export function extractJavaImports(source: string): JavaImport[] {
+  const out: JavaImport[] = [];
+  const re = /^\s*import\s+(static\s+)?([A-Za-z_$][\w$.]*?)(\.\*)?\s*;/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    const isStatic = Boolean(m[1]);
+    const wildcard = Boolean(m[3]);
+    let fqn = m[2];
+    // `import static a.b.C.member;` → the type is everything but the member.
+    if (isStatic && !wildcard) {
+      const dot = fqn.lastIndexOf(".");
+      if (dot > 0) fqn = fqn.slice(0, dot);
+    }
+    out.push({ fqn, packageWildcard: wildcard && !isStatic });
+  }
+  return out;
+}
+
+/**
+ * Resolve a Java import to the repo file(s) it references via the
+ * package→directory convention. The FQN path is always a suffix of the actual
+ * file path (the source root — `src/main/java`, `src/test/java`, `src`, … — is
+ * a prefix), so this matches by suffix and is therefore source-root agnostic
+ * with zero configuration.
+ *
+ * - Package wildcard → every `.java` file directly in the matching package dir.
+ * - Type import (incl. static member / static wildcard) → the single class file,
+ *   matching the longest FQN prefix that resolves to a file so nested classes
+ *   and static members map to their enclosing top-level class file.
+ *
+ * Standard-library and third-party imports match no repo file and yield no edge.
+ */
+export function resolveJavaImport(imp: JavaImport, javaFiles: string[]): string[] {
+  if (imp.packageWildcard) {
+    const pkgPath = imp.fqn.split(".").filter(Boolean).join("/");
+    if (!pkgPath) return [];
+    return javaFiles.filter((f) => {
+      const d = dirOf(f);
+      return d === pkgPath || d.endsWith("/" + pkgPath);
+    });
+  }
+
+  const parts = imp.fqn.split(".").filter(Boolean);
+  for (let len = parts.length; len >= 1; len--) {
+    const suffix = parts.slice(0, len).join("/") + ".java";
+    const hit = javaFiles.find((f) => f === suffix || f.endsWith("/" + suffix));
+    if (hit) return [hit];
+  }
+  return [];
 }
 
 /**
@@ -473,6 +556,9 @@ export function buildDependencyGraph(
   // Precompute Go package directories and module path once for the whole graph.
   const goDirs = collectGoPackageDirs(fileSet);
   const goModulePath = parseGoModulePath(files);
+
+  // Precompute Java file list once for the whole graph.
+  const javaFiles = [...fileSet].filter((f) => f.endsWith(".java"));
 
   for (const path of fileSet) {
     imports.set(path, new Set());
@@ -498,6 +584,12 @@ export function buildDependencyGraph(
     } else if (lang === "go") {
       for (const spec of extractGoImports(file.content)) {
         for (const resolved of resolveGoImport(spec, goDirs, goModulePath)) {
+          resolvedPaths.push(resolved);
+        }
+      }
+    } else if (lang === "java") {
+      for (const imp of extractJavaImports(file.content)) {
+        for (const resolved of resolveJavaImport(imp, javaFiles)) {
           resolvedPaths.push(resolved);
         }
       }
