@@ -26,10 +26,12 @@ const INDEX_FILES = JS_TS_EXTENSIONS.map((ext) => `index${ext}`);
 
 const PY_EXTENSIONS = [".py", ".pyi"];
 
-/** Every source extension whose imports this engine can parse. */
-export const SOURCE_EXTENSIONS = [...JS_TS_EXTENSIONS, ...PY_EXTENSIONS];
+const GO_EXTENSIONS = [".go"];
 
-export type SourceLanguage = "js" | "py";
+/** Every source extension whose imports this engine can parse. */
+export const SOURCE_EXTENSIONS = [...JS_TS_EXTENSIONS, ...PY_EXTENSIONS, ...GO_EXTENSIONS];
+
+export type SourceLanguage = "js" | "py" | "go";
 
 /** A single edge: `from` imports `to`. */
 export interface DependencyEdge {
@@ -74,6 +76,7 @@ export interface PrImpactReport {
 export function detectSourceLanguage(path: string): SourceLanguage | null {
   if (JS_TS_EXTENSIONS.some((ext) => path.endsWith(ext))) return "js";
   if (PY_EXTENSIONS.some((ext) => path.endsWith(ext))) return "py";
+  if (GO_EXTENSIONS.some((ext) => path.endsWith(ext))) return "go";
   return null;
 }
 
@@ -357,6 +360,100 @@ export function resolvePythonImport(
   return [...results];
 }
 
+// ---------------------------------------------------------------------------
+// Go import support
+// ---------------------------------------------------------------------------
+
+/** Remove Go block and line comments so commented-out or paren-bearing
+ *  comments don't corrupt import parsing. Not string-aware (consistent with
+ *  the other best-effort extractors); import paths never contain `//`. */
+function stripGoComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
+}
+
+/**
+ * Extract the imported package paths from Go source. Handles single-line
+ * imports (`import "fmt"`, `import alias "path"`, `import _ "path"`,
+ * `import . "path"`) and grouped blocks (`import ( ... )`). Only the quoted
+ * import path is captured; the alias/blank/dot qualifier is irrelevant to the
+ * dependency edge (it still pulls in the package).
+ */
+export function extractGoImports(source: string): string[] {
+  const text = stripGoComments(source);
+  const paths: string[] = [];
+  const specRe = /(?:[A-Za-z_]\w*\s+|_\s+|\.\s+)?"([^"]+)"/g;
+
+  // Grouped: import ( ... )
+  const groupRe = /\bimport\s*\(([\s\S]*?)\)/g;
+  let gm: RegExpExecArray | null;
+  while ((gm = groupRe.exec(text)) !== null) {
+    const block = gm[1];
+    specRe.lastIndex = 0;
+    let sm: RegExpExecArray | null;
+    while ((sm = specRe.exec(block)) !== null) paths.push(sm[1]);
+  }
+
+  // Single-line: import [alias|_|.] "path"
+  const singleRe = /\bimport\s+(?:[A-Za-z_]\w*\s+|_\s+|\.\s+)?"([^"]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = singleRe.exec(text)) !== null) paths.push(m[1]);
+
+  return paths;
+}
+
+/** Map each repo directory containing non-test `.go` files to those files. */
+function collectGoPackageDirs(fileSet: Set<string>): Map<string, string[]> {
+  const dirs = new Map<string, string[]>();
+  for (const path of fileSet) {
+    if (!path.endsWith(".go") || path.endsWith("_test.go")) continue;
+    const dir = dirOf(path);
+    const list = dirs.get(dir);
+    if (list) list.push(path);
+    else dirs.set(dir, [path]);
+  }
+  return dirs;
+}
+
+/** Parse the `module` path from a go.mod file in the set, if one is present. */
+function parseGoModulePath(files: Array<{ path: string; content: string }>): string | undefined {
+  const mod = files.find((f) => f.path === "go.mod" || f.path.endsWith("/go.mod"));
+  if (!mod) return undefined;
+  const m = /^\s*module\s+(\S+)/m.exec(mod.content);
+  return m ? m[1] : undefined;
+}
+
+/**
+ * Resolve a Go import path to the repo files it references. Go imports a
+ * *package* (a directory), so the edge points at every non-test `.go` file in
+ * that package directory.
+ *
+ * The in-repo package directory is always a trailing segment of the full
+ * import path — the module-path prefix declared in go.mod maps to the repo
+ * root. So we match the longest known package directory that is a suffix of
+ * the import path. When `modulePath` is supplied and the import falls under it,
+ * the prefix is stripped directly for an exact, unambiguous match. Standard
+ * library and external imports resolve to nothing (no repo directory matches).
+ */
+export function resolveGoImport(
+  importPath: string,
+  goDirs: Map<string, string[]>,
+  modulePath?: string
+): string[] {
+  if (modulePath && (importPath === modulePath || importPath.startsWith(modulePath + "/"))) {
+    const rel = importPath === modulePath ? "" : importPath.slice(modulePath.length + 1);
+    return goDirs.get(rel) ?? [];
+  }
+
+  let best: string | null = null;
+  for (const dir of goDirs.keys()) {
+    if (dir === "") continue;
+    if (importPath === dir || importPath.endsWith("/" + dir)) {
+      if (best === null || dir.length > best.length) best = dir;
+    }
+  }
+  return best !== null ? goDirs.get(best) ?? [] : [];
+}
+
 /**
  * Build a dependency graph from a list of files and their contents.
  *
@@ -372,6 +469,10 @@ export function buildDependencyGraph(
   const fileSet = new Set(files.map((f) => f.path));
   const imports = new Map<string, Set<string>>();
   const importedBy = new Map<string, Set<string>>();
+
+  // Precompute Go package directories and module path once for the whole graph.
+  const goDirs = collectGoPackageDirs(fileSet);
+  const goModulePath = parseGoModulePath(files);
 
   for (const path of fileSet) {
     imports.set(path, new Set());
@@ -391,6 +492,12 @@ export function buildDependencyGraph(
     } else if (lang === "py") {
       for (const imp of extractPythonImports(file.content)) {
         for (const resolved of resolvePythonImport(file.path, imp, fileSet, pythonRoots)) {
+          resolvedPaths.push(resolved);
+        }
+      }
+    } else if (lang === "go") {
+      for (const spec of extractGoImports(file.content)) {
+        for (const resolved of resolveGoImport(spec, goDirs, goModulePath)) {
           resolvedPaths.push(resolved);
         }
       }
