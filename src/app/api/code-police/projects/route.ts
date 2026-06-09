@@ -64,7 +64,7 @@ export async function GET(request: NextRequest) {
         .get();
     }
 
-    const projects = projectsSnapshot.docs.map((doc) => {
+    let projects = projectsSnapshot.docs.map((doc) => {
       const data = doc.data();
       return {
         id: doc.id,
@@ -76,6 +76,16 @@ export async function GET(request: NextRequest) {
         createdAt: data.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
       };
     });
+
+    const searchQuery = request.nextUrl.searchParams.get("search");
+    if (searchQuery) {
+      const lowerCaseSearchQuery = searchQuery.toLowerCase();
+      projects = projects.filter(
+        (project) =>
+          project.name.toLowerCase().includes(lowerCaseSearchQuery) ||
+          project.githubFullName.toLowerCase().includes(lowerCaseSearchQuery)
+      );
+    }
 
     // Fetch latest analysis run for each project
     const projectsWithRuns = await Promise.all(
