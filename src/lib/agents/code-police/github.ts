@@ -9,6 +9,206 @@ import type { GitHubRepo } from "@/types";
 
 const GITHUB_API_BASE = "https://api.github.com";
 
+/**
+ * ----------------------------------------------------------------------------
+ * Rate-limit-aware fetch wrapper
+ * ----------------------------------------------------------------------------
+ * Every GitHub call in this module goes through githubFetch so that transient
+ * failures are handled in one place instead of per call site:
+ *
+ *  - 429, and 403 with `x-ratelimit-remaining: 0`, are treated as rate limits.
+ *    The wait honors `Retry-After` (seconds) or `x-ratelimit-reset` (epoch),
+ *    capped by maxDelayMs.
+ *  - 5xx and network/transport errors get capped exponential backoff with
+ *    jitter.
+ *  - If a rate-limit reset is further out than the retry budget, a typed
+ *    GitHubRateLimitError is thrown immediately so callers can degrade rather
+ *    than block (important in a serverless context).
+ *  - Any other response (2xx/3xx/404/401/422/plain 403) is returned unchanged,
+ *    so each caller's existing `!response.ok` handling behaves exactly as before.
+ *
+ * The three numeric knobs default sensibly, can be overridden per call via
+ * `options`, and also fall back to env vars for deployment-level tuning.
+ * Precedence: explicit option > env var > built-in default.
+ */
+export interface GithubFetchOptions {
+  /** Retry attempts after the initial try. Default 4 (env: GITHUB_FETCH_MAX_RETRIES). */
+  maxRetries?: number;
+  /** Base backoff delay in ms for 5xx/network retries. Default 1000 (env: GITHUB_FETCH_BASE_DELAY_MS). */
+  baseDelayMs?: number;
+  /** Cap (ms) on any single wait; a longer required rate-limit wait throws instead. Default 60000 (env: GITHUB_FETCH_MAX_DELAY_MS). */
+  maxDelayMs?: number;
+  /** Injectable fetch, mainly for testing. Defaults to the global fetch. */
+  fetchImpl?: typeof fetch;
+  /** Injectable sleep, mainly for testing. Defaults to a setTimeout-based delay. */
+  sleepImpl?: (ms: number) => Promise<void>;
+}
+
+/** Thrown when a GitHub rate limit cannot be cleared within the retry budget. */
+export class GitHubRateLimitError extends Error {
+  readonly status: number;
+  readonly retryAfterMs: number | null;
+  readonly resetAt: Date | null;
+
+  constructor(
+    message: string,
+    info: { status: number; retryAfterMs: number | null; resetAt: Date | null }
+  ) {
+    super(message);
+    this.name = "GitHubRateLimitError";
+    this.status = info.status;
+    this.retryAfterMs = info.retryAfterMs;
+    this.resetAt = info.resetAt;
+  }
+}
+
+function readEnvInt(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Capped exponential backoff with equal jitter (half fixed, half random). */
+function backoffDelayMs(attempt: number, baseMs: number, maxMs: number): number {
+  const ceiling = Math.min(baseMs * Math.pow(2, attempt), maxMs);
+  const half = ceiling / 2;
+  return Math.floor(half + Math.random() * half);
+}
+
+/** Statuses we transparently retry as transient server errors. */
+function isTransientServerError(status: number): boolean {
+  return status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+/**
+ * If the response indicates a rate limit, returns how long to wait (ms);
+ * otherwise null. Prefers Retry-After, then x-ratelimit-reset.
+ */
+function rateLimitWaitMs(response: Response): number | null {
+  const retryAfter = response.headers.get("retry-after");
+  if (retryAfter !== null) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  }
+  const remaining = response.headers.get("x-ratelimit-remaining");
+  const reset = response.headers.get("x-ratelimit-reset");
+  if (remaining === "0" && reset !== null) {
+    const resetMs = Number(reset) * 1000;
+    if (Number.isFinite(resetMs)) return Math.max(0, resetMs - Date.now());
+  }
+  return null;
+}
+
+function resetDateFrom(response: Response): Date | null {
+  const reset = response.headers.get("x-ratelimit-reset");
+  if (reset === null) return null;
+  const epoch = Number(reset);
+  return Number.isFinite(epoch) ? new Date(epoch * 1000) : null;
+}
+
+function retryAfterMsFrom(response: Response): number | null {
+  const retryAfter = response.headers.get("retry-after");
+  if (retryAfter === null) return null;
+  const seconds = Number(retryAfter);
+  return Number.isFinite(seconds) ? seconds * 1000 : null;
+}
+
+/**
+ * fetch() for the GitHub API with retry, backoff and rate-limit handling.
+ * Drop-in replacement: returns the final Response for the caller to inspect,
+ * and only throws GitHubRateLimitError (rate limit unrecoverable within budget)
+ * or re-throws a network error after retries are exhausted.
+ */
+export async function githubFetch(
+  url: string | URL,
+  init?: RequestInit,
+  options: GithubFetchOptions = {}
+): Promise<Response> {
+  const doFetch = options.fetchImpl ?? fetch;
+  const sleep = options.sleepImpl ?? defaultSleep;
+  const maxRetries =
+    options.maxRetries ?? readEnvInt("GITHUB_FETCH_MAX_RETRIES") ?? 4;
+  const baseDelayMs =
+    options.baseDelayMs ?? readEnvInt("GITHUB_FETCH_BASE_DELAY_MS") ?? 1000;
+  const maxDelayMs =
+    options.maxDelayMs ?? readEnvInt("GITHUB_FETCH_MAX_DELAY_MS") ?? 60000;
+
+  const totalAttempts = maxRetries + 1;
+  let attempt = 0;
+
+  for (;;) {
+    let response: Response;
+    try {
+      response = await doFetch(url, init);
+    } catch (networkError) {
+      // Transport-level failure (DNS, socket, abort): retry if budget remains.
+      if (attempt >= maxRetries) throw networkError;
+      const delay = backoffDelayMs(attempt, baseDelayMs, maxDelayMs);
+      console.warn(
+        `[GitHub] Network error (attempt ${attempt + 1}/${totalAttempts}), retrying in ${delay}ms: ` +
+          (networkError instanceof Error ? networkError.message : String(networkError))
+      );
+      await sleep(delay);
+      attempt++;
+      continue;
+    }
+
+    const waitMs = rateLimitWaitMs(response);
+    const isRateLimited =
+      response.status === 429 || (response.status === 403 && waitMs !== null);
+
+    if (isRateLimited) {
+      // Reset is further out than we are willing to wait: surface a typed error
+      // so the caller can degrade now instead of blocking the request.
+      if (waitMs !== null && waitMs > maxDelayMs) {
+        throw new GitHubRateLimitError(
+          `GitHub rate limit exceeded; resets in ${Math.ceil(waitMs / 1000)}s, ` +
+            `beyond the ${Math.ceil(maxDelayMs / 1000)}s retry budget`,
+          { status: response.status, retryAfterMs: retryAfterMsFrom(response), resetAt: resetDateFrom(response) }
+        );
+      }
+      if (attempt >= maxRetries) {
+        throw new GitHubRateLimitError(
+          `GitHub rate limit not cleared after ${totalAttempts} attempts`,
+          { status: response.status, retryAfterMs: retryAfterMsFrom(response), resetAt: resetDateFrom(response) }
+        );
+      }
+      const delay =
+        waitMs !== null
+          ? Math.min(waitMs, maxDelayMs)
+          : backoffDelayMs(attempt, baseDelayMs, maxDelayMs);
+      console.warn(
+        `[GitHub] Rate limited (status ${response.status}, attempt ${attempt + 1}/${totalAttempts}), waiting ${delay}ms`
+      );
+      await sleep(delay);
+      attempt++;
+      continue;
+    }
+
+    if (isTransientServerError(response.status)) {
+      // Out of retries: return the final response so the caller's existing
+      // !response.ok handling throws/degrades exactly as it did before.
+      if (attempt >= maxRetries) return response;
+      const delay = backoffDelayMs(attempt, baseDelayMs, maxDelayMs);
+      console.warn(
+        `[GitHub] Server error ${response.status} (attempt ${attempt + 1}/${totalAttempts}), retrying in ${delay}ms`
+      );
+      await sleep(delay);
+      attempt++;
+      continue;
+    }
+
+    // Success or a non-retryable status: hand back unchanged.
+    return response;
+  }
+}
+
+
 interface GitHubUser {
   login: string;
   avatar_url: string;
@@ -18,7 +218,7 @@ interface GitHubUser {
  * Fetch repositories for an authenticated user
  */
 export async function fetchUserRepos(accessToken: string): Promise<GitHubRepo[]> {
-  const response = await fetch(`${GITHUB_API_BASE}/user/repos?per_page=100&sort=updated`, {
+  const response = await githubFetch(`${GITHUB_API_BASE}/user/repos?per_page=100&sort=updated`, {
     headers: {
       Authorization: `Bearer ${accessToken}`,
       Accept: "application/vnd.github.v3+json",
@@ -70,7 +270,7 @@ export async function fetchFileContent(
 
   console.log("[GitHub] Fetching file: " + url.toString());
 
-  const response = await fetch(url.toString(), {
+  const response = await githubFetch(url.toString(), {
     headers: {
       Authorization: "Bearer " + accessToken,
       Accept: "application/vnd.github.v3.raw",
@@ -84,7 +284,7 @@ export async function fetchFileContent(
       const fallbackUrl = new URL(GITHUB_API_BASE + "/repos/" + owner + "/" + repo + "/contents/" + cleanPath);
       fallbackUrl.searchParams.set("ref", fallbackBranch);
 
-      const fallbackResponse = await fetch(fallbackUrl.toString(), {
+      const fallbackResponse = await githubFetch(fallbackUrl.toString(), {
         headers: {
           Authorization: "Bearer " + accessToken,
           Accept: "application/vnd.github.v3.raw",
@@ -139,7 +339,7 @@ export async function fetchCommit(
     patch?: string;
   }>;
 }> {
-  const response = await fetch(
+  const response = await githubFetch(
     `${GITHUB_API_BASE}/repos/${owner}/${repo}/commits/${sha}`,
     {
       headers: {
@@ -183,7 +383,7 @@ export async function fetchCommitDiff(
     commit: { message: string; author: { name: string; email: string } };
   }>;
 }> {
-  const response = await fetch(
+  const response = await githubFetch(
     `${GITHUB_API_BASE}/repos/${owner}/${repo}/compare/${baseSha}...${headSha}`,
     {
       headers: {
@@ -219,7 +419,7 @@ export async function fetchRepoTree(
   }>;
   truncated: boolean;
 }> {
-  const response = await fetch(
+  const response = await githubFetch(
     `${GITHUB_API_BASE}/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`,
     {
       headers: {
@@ -252,32 +452,28 @@ export async function fetchRepoStats(
   codeFrequency: Array<[number, number, number]>; // [timestamp, additions, deletions]
   commitActivity: Array<{ days: number[]; total: number; week: number }>;
 }> {
+  // Stats endpoints are wrapped so a thrown rate-limit error degrades to an
+  // empty dataset, preserving this function's original non-throwing contract.
+  const statsHeaders = {
+    Authorization: `Bearer ${accessToken}`,
+    Accept: "application/vnd.github.v3+json",
+  };
+  const safeStatsFetch = (path: string): Promise<Response | null> =>
+    githubFetch(`${GITHUB_API_BASE}/repos/${owner}/${repo}/${path}`, {
+      headers: statsHeaders,
+    }).catch(() => null);
+
   // Fetch multiple stats in parallel
   const [contributorRes, codeFreqRes, commitActivityRes] = await Promise.all([
-    fetch(`${GITHUB_API_BASE}/repos/${owner}/${repo}/stats/contributors`, {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        Accept: "application/vnd.github.v3+json",
-      },
-    }),
-    fetch(`${GITHUB_API_BASE}/repos/${owner}/${repo}/stats/code_frequency`, {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        Accept: "application/vnd.github.v3+json",
-      },
-    }),
-    fetch(`${GITHUB_API_BASE}/repos/${owner}/${repo}/stats/commit_activity`, {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        Accept: "application/vnd.github.v3+json",
-      },
-    }),
+    safeStatsFetch("stats/contributors"),
+    safeStatsFetch("stats/code_frequency"),
+    safeStatsFetch("stats/commit_activity"),
   ]);
 
-  // GitHub returns 202 if stats are being computed - retry in that case
-  const contributorStats = contributorRes.ok ? await contributorRes.json() : [];
-  const codeFrequency = codeFreqRes.ok ? await codeFreqRes.json() : [];
-  const commitActivity = commitActivityRes.ok ? await commitActivityRes.json() : [];
+  // GitHub returns 202 if stats are being computed - treat non-ok as no data
+  const contributorStats = contributorRes && contributorRes.ok ? await contributorRes.json() : [];
+  const codeFrequency = codeFreqRes && codeFreqRes.ok ? await codeFreqRes.json() : [];
+  const commitActivity = commitActivityRes && commitActivityRes.ok ? await commitActivityRes.json() : [];
 
   return {
     contributorStats: Array.isArray(contributorStats) ? contributorStats : [],
@@ -337,7 +533,7 @@ export async function createWebhook(
   webhookUrl: string,
   secret: string
 ): Promise<{ id: number }> {
-  const response = await fetch(
+  const response = await githubFetch(
     `${GITHUB_API_BASE}/repos/${owner}/${repo}/hooks`,
     {
       method: "POST",
@@ -377,7 +573,7 @@ export async function deleteWebhook(
   repo: string,
   webhookId: number
 ): Promise<void> {
-  const response = await fetch(
+  const response = await githubFetch(
     `${GITHUB_API_BASE}/repos/${owner}/${repo}/hooks/${webhookId}`,
     {
       method: "DELETE",
@@ -418,7 +614,7 @@ export async function fetchReadme(
  * Get authenticated user info
  */
 export async function getAuthenticatedUser(accessToken: string): Promise<GitHubUser> {
-  const response = await fetch(`${GITHUB_API_BASE}/user`, {
+  const response = await githubFetch(`${GITHUB_API_BASE}/user`, {
     headers: {
       Authorization: `Bearer ${accessToken}`,
       Accept: "application/vnd.github.v3+json",
@@ -498,7 +694,7 @@ export async function getDependentFiles(
 
   for (const query of searchQueries.slice(0, 1)) { // Limit API calls
     try {
-      const response = await fetch(
+      const response = await githubFetch(
         `${GITHUB_API_BASE}/search/code?q=${encodeURIComponent(query)}+repo:${owner}/${repo}&per_page=5`,
         {
           headers: {
@@ -546,7 +742,7 @@ export async function postPRComment(
   body: string
 ): Promise<{ id: number } | null> {
   try {
-    const response = await fetch(
+    const response = await githubFetch(
       `${GITHUB_API_BASE}/repos/${owner}/${repo}/issues/${prNumber}/comments`,
       {
         method: "POST",
