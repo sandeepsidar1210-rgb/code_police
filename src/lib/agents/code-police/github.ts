@@ -89,11 +89,21 @@ function isTransientServerError(status: number): boolean {
  * If the response indicates a rate limit, returns how long to wait (ms);
  * otherwise null. Prefers Retry-After, then x-ratelimit-reset.
  */
+function parseRetryAfterMs(value: string): number | null {
+  // Numeric seconds (most common — GitHub uses this form)
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  // HTTP-date form: "Retry-After: Wed, 21 Oct 2026 07:28:00 GMT"
+  const date = new Date(value);
+  if (!isNaN(date.getTime())) return Math.max(0, date.getTime() - Date.now());
+  return null;
+}
+
 function rateLimitWaitMs(response: Response): number | null {
   const retryAfter = response.headers.get("retry-after");
   if (retryAfter !== null) {
-    const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+    const ms = parseRetryAfterMs(retryAfter);
+    if (ms !== null) return ms;
   }
   const remaining = response.headers.get("x-ratelimit-remaining");
   const reset = response.headers.get("x-ratelimit-reset");
@@ -114,8 +124,7 @@ function resetDateFrom(response: Response): Date | null {
 function retryAfterMsFrom(response: Response): number | null {
   const retryAfter = response.headers.get("retry-after");
   if (retryAfter === null) return null;
-  const seconds = Number(retryAfter);
-  return Number.isFinite(seconds) ? seconds * 1000 : null;
+  return parseRetryAfterMs(retryAfter);
 }
 
 /**
@@ -146,7 +155,10 @@ export async function githubFetch(
     try {
       response = await doFetch(url, init);
     } catch (networkError) {
-      // Transport-level failure (DNS, socket, abort): retry if budget remains.
+      // Abort signals must propagate immediately — retrying a cancelled request
+      // defeats caller intent and wastes the retry budget.
+      if (networkError instanceof Error && networkError.name === "AbortError") throw networkError;
+      // Transport-level failure (DNS, socket, etc.): retry if budget remains.
       if (attempt >= maxRetries) throw networkError;
       const delay = backoffDelayMs(attempt, baseDelayMs, maxDelayMs);
       console.warn(
@@ -159,13 +171,17 @@ export async function githubFetch(
     }
 
     const waitMs = rateLimitWaitMs(response);
-    const isRateLimited =
-      response.status === 429 || (response.status === 403 && waitMs !== null);
+    // A 403 is rate-limited if x-ratelimit-remaining is "0" regardless of
+    // whether a parseable reset time is present (fixes narrow detection).
+    const isRateLimited403 =
+      response.status === 403 && response.headers.get("x-ratelimit-remaining") === "0";
+    const isRateLimited = response.status === 429 || isRateLimited403;
 
     if (isRateLimited) {
       // Reset is further out than we are willing to wait: surface a typed error
       // so the caller can degrade now instead of blocking the request.
       if (waitMs !== null && waitMs > maxDelayMs) {
+        response.body?.cancel().catch(() => {});
         throw new GitHubRateLimitError(
           `GitHub rate limit exceeded; resets in ${Math.ceil(waitMs / 1000)}s, ` +
             `beyond the ${Math.ceil(maxDelayMs / 1000)}s retry budget`,
@@ -173,6 +189,7 @@ export async function githubFetch(
         );
       }
       if (attempt >= maxRetries) {
+        response.body?.cancel().catch(() => {});
         throw new GitHubRateLimitError(
           `GitHub rate limit not cleared after ${totalAttempts} attempts`,
           { status: response.status, retryAfterMs: retryAfterMsFrom(response), resetAt: resetDateFrom(response) }
@@ -185,6 +202,8 @@ export async function githubFetch(
       console.warn(
         `[GitHub] Rate limited (status ${response.status}, attempt ${attempt + 1}/${totalAttempts}), waiting ${delay}ms`
       );
+      // Cancel the unread body to free the underlying socket before sleeping.
+      response.body?.cancel().catch(() => {});
       await sleep(delay);
       attempt++;
       continue;
@@ -198,6 +217,8 @@ export async function githubFetch(
       console.warn(
         `[GitHub] Server error ${response.status} (attempt ${attempt + 1}/${totalAttempts}), retrying in ${delay}ms`
       );
+      // Cancel the unread body to free the underlying socket before sleeping.
+      response.body?.cancel().catch(() => {});
       await sleep(delay);
       attempt++;
       continue;
