@@ -55,6 +55,8 @@ export default function CodePolicePage() {
   const [totalPages, setTotalPages] = useState(1);
   const [totalProjects, setTotalProjects] = useState(0);
 
+  const [searchQuery, setSearchQuery] = useState("");
+
   useEffect(() => {
     if (!userId) {
       router.push("/sign-in");
@@ -62,12 +64,12 @@ export default function CodePolicePage() {
     }
 
     fetchProjects(1);
-  }, [userId, router]);
+  }, [userId, router, searchQuery]);
 
   const fetchProjects = async (page = 1) => {
     setLoading(true);
     try {
-      const response = await fetch(`/api/code-police/projects?page=${page}&limit=5`);
+      const response = await fetch(`/api/code-police/projects?page=${page}&limit=5&search=${searchQuery}`);
       if (response.ok) {
         const data = await response.json();
         setProjects(data.projects || []);
@@ -107,13 +109,22 @@ export default function CodePolicePage() {
             AI-powered code review for your GitHub repositories
           </p>
         </div>
-        <Link
-          href="/dashboard/code-police/connect"
-          className="inline-flex items-center gap-2 px-4 py-2.5 bg-red-500 hover:bg-red-600 text-white font-medium rounded-xl transition-colors"
-        >
-          <Plus className="w-4 h-4" />
-          Connect Repository
-        </Link>
+        <div className="flex items-center gap-4">
+          <input
+            type="text"
+            placeholder="Search projects..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="px-4 py-2.5 bg-zinc-800 border border-zinc-700 rounded-xl text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-red-500"
+          />
+          <Link
+            href="/dashboard/code-police/connect"
+            className="inline-flex items-center gap-2 px-4 py-2.5 bg-red-500 hover:bg-red-600 text-white font-medium rounded-xl transition-colors"
+          >
+            <Plus className="w-4 h-4" />
+            Connect Repository
+          </Link>
+        </div>
       </div>
 
       {/* Projects List */}
