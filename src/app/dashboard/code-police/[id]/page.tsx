@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, use } from "react";
+import { useState, useEffect, use, useRef } from "react";
 import Link from "next/link";
 import {
   Shield,
@@ -110,6 +110,104 @@ export default function ProjectDetailPage({ params }: { params: Promise<{ id: st
   const [isLoadingIssues, setIsLoadingIssues] = useState<string | null>(null);
   const [isCreatingPR, setIsCreatingPR] = useState<string | null>(null);
   const [isSimulating, setIsSimulating] = useState(false);
+
+  // WebSocket progress state
+  const [analysisProgress, setAnalysisProgress] = useState<{
+    status: string;
+    progress: number;
+    details?: string;
+    logs: string[];
+  } | null>(null);
+
+  const logsEndRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll to bottom of logs
+  useEffect(() => {
+    if (logsEndRef.current) {
+      logsEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [analysisProgress?.logs]);
+
+  // WebSocket connection management
+  useEffect(() => {
+    if (!projectId) return;
+
+    let ws: WebSocket | null = null;
+    let reconnectTimeout: NodeJS.Timeout | null = null;
+
+    const connect = () => {
+      try {
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const host = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
+          ? `${window.location.hostname}:3001`
+          : window.location.host;
+
+        const wsUrl = `${protocol}//${host}`;
+        console.log(`[WebSocket] Connecting to ${wsUrl}`);
+        
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+          console.log(`[WebSocket] Connected. Subscribing to project ${projectId}`);
+          ws?.send(JSON.stringify({ type: "subscribe", projectId }));
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === "progress" && data.projectId === projectId) {
+              setIsAnalyzing(true);
+              setAnalysisProgress((prev) => {
+                const currentLogs = prev?.logs || [];
+                const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                const logEntry = `[${timestamp}] ${data.status}${data.details ? ` - ${data.details}` : ""}`;
+                
+                const isDuplicate = currentLogs.length > 0 && currentLogs[currentLogs.length - 1].includes(data.status);
+                const nextLogs = isDuplicate ? currentLogs : [...currentLogs, logEntry];
+                
+                return {
+                  status: data.status,
+                  progress: data.progress,
+                  details: data.details,
+                  logs: nextLogs,
+                };
+              });
+
+              if (data.progress === 100) {
+                setTimeout(() => {
+                  setAnalysisProgress(null);
+                  setIsAnalyzing(false);
+                  fetchData(true);
+                }, 2000);
+              }
+            }
+          } catch (e) {
+            console.error("[WebSocket] Message parsing error:", e);
+          }
+        };
+
+        ws.onclose = () => {
+          console.log("[WebSocket] Connection closed");
+          reconnectTimeout = setTimeout(() => {
+            connect();
+          }, 3000);
+        };
+
+        ws.onerror = (err) => {
+          console.error("[WebSocket] Connection error:", err);
+        };
+      } catch (e) {
+        console.error("[WebSocket] Connection setup failed:", e);
+      }
+    };
+
+    connect();
+
+    return () => {
+      if (ws) ws.close();
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+    };
+  }, [projectId]);
 
   // Fetch project and analysis runs
   const fetchData = async (showRefresh = false) => {
@@ -569,6 +667,65 @@ export default function ProjectDetailPage({ params }: { params: Promise<{ id: st
             Auto-refresh every 30s
           </span>
         </div>
+
+        {/* Real-time WebSocket Progress Card */}
+        {analysisProgress && (
+          <div className="bg-zinc-950/80 border border-red-500/25 rounded-2xl p-6 space-y-4 shadow-xl shadow-red-950/10 backdrop-blur-sm">
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <div className="p-2 rounded-xl bg-red-500/10 animate-pulse">
+                  <Shield className="w-5 h-5 text-red-400" />
+                </div>
+                <div>
+                  <h3 className="font-semibold text-white flex items-center gap-2">
+                    Analyzing Codebase...
+                  </h3>
+                  <p className="text-xs text-zinc-400">{analysisProgress.status}</p>
+                </div>
+              </div>
+              <div className="text-right">
+                <span className="text-sm font-bold text-red-400">{analysisProgress.progress}%</span>
+              </div>
+            </div>
+
+            {/* Progress Bar */}
+            <div className="h-1.5 w-full bg-zinc-800 rounded-full overflow-hidden">
+              <div 
+                className="h-full bg-gradient-to-r from-red-600 to-red-400 rounded-full transition-all duration-300 ease-out"
+                style={{ width: `${analysisProgress.progress}%` }}
+              />
+            </div>
+
+            {/* Terminal logs viewer */}
+            {analysisProgress.logs && analysisProgress.logs.length > 0 && (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-mono text-zinc-500 uppercase tracking-wider">Analysis Logs</span>
+                  {analysisProgress.details && (
+                    <span className="text-[10px] text-zinc-500 truncate max-w-[200px] font-mono">{analysisProgress.details}</span>
+                  )}
+                </div>
+                <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-3.5 h-36 overflow-y-auto font-mono text-xs text-zinc-300 space-y-1 scrollbar-thin scrollbar-thumb-zinc-800 scrollbar-track-transparent">
+                  {analysisProgress.logs.map((log, index) => {
+                    const isError = log.includes("Error:") || log.includes("failed");
+                    const isSuccess = log.includes("complete") || log.includes("success");
+                    return (
+                      <div 
+                        key={index} 
+                        className={`leading-relaxed whitespace-pre-wrap select-all ${
+                          isError ? "text-red-400 font-medium" : isSuccess ? "text-emerald-400 font-medium" : "text-zinc-300"
+                        }`}
+                      >
+                        {log}
+                      </div>
+                    );
+                  })}
+                  <div ref={logsEndRef} />
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         {runs.length === 0 ? (
           <div className="bg-zinc-900/50 border border-zinc-800 rounded-2xl p-8 text-center">

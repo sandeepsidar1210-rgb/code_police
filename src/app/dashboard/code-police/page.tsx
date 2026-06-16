@@ -15,6 +15,8 @@ import {
   ArrowRight,
   Trash2,
   Loader2,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
 import { GhostfounderLoader } from "@/components/ui/ghostfounder-loader";
 import { toast } from "sonner";
@@ -50,6 +52,11 @@ export default function CodePolicePage() {
   const router = useRouter();
   const [projects, setProjects] = useState<(Project & { lastRun: AnalysisRun | null })[]>([]);
   const [loading, setLoading] = useState(true);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [totalProjects, setTotalProjects] = useState(0);
+
+  const [searchQuery, setSearchQuery] = useState("");
 
   useEffect(() => {
     if (!userId) {
@@ -57,8 +64,8 @@ export default function CodePolicePage() {
       return;
     }
 
-    fetchProjects();
-  }, [userId, router]);
+    fetchProjects(1);
+  }, [userId, router, searchQuery]);
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -71,12 +78,18 @@ export default function CodePolicePage() {
     }
   }, []);
 
-  const fetchProjects = async () => {
+  const fetchProjects = async (page = 1) => {
+    setLoading(true);
     try {
-      const response = await fetch('/api/code-police/projects');
+      const response = await fetch(`/api/code-police/projects?page=${page}&limit=5&search=${searchQuery}`);
       if (response.ok) {
         const data = await response.json();
         setProjects(data.projects || []);
+        if (data.pagination) {
+          setCurrentPage(data.pagination.page || 1);
+          setTotalPages(data.pagination.totalPages || 1);
+          setTotalProjects(data.pagination.total || 0);
+        }
       }
     } catch (error) {
       console.error('Error fetching projects:', error);
@@ -108,13 +121,22 @@ export default function CodePolicePage() {
             AI-powered code review for your GitHub repositories
           </p>
         </div>
-        <Link
-          href="/dashboard/code-police/connect"
-          className="inline-flex items-center gap-2 px-4 py-2.5 bg-red-500 hover:bg-red-600 text-white font-medium rounded-xl transition-colors"
-        >
-          <Plus className="w-4 h-4" />
-          Connect Repository
-        </Link>
+        <div className="flex items-center gap-4">
+          <input
+            type="text"
+            placeholder="Search projects..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="px-4 py-2.5 bg-zinc-800 border border-zinc-700 rounded-xl text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-red-500"
+          />
+          <Link
+            href="/dashboard/code-police/connect"
+            className="inline-flex items-center gap-2 px-4 py-2.5 bg-red-500 hover:bg-red-600 text-white font-medium rounded-xl transition-colors"
+          >
+            <Plus className="w-4 h-4" />
+            Connect Repository
+          </Link>
+        </div>
       </div>
 
       {/* Projects List */}
@@ -122,13 +144,89 @@ export default function CodePolicePage() {
         <EmptyState />
       ) : (
         <div className="grid gap-4">
-          {projects.map((project) => (
-            <ProjectCard
-              key={project.id}
-              project={project}
-              onDisconnect={fetchProjects}
-            />
-          ))}
+          <div className="grid gap-4">
+            {projects.map((project) => (
+              <ProjectCard
+                key={project.id}
+                project={project}
+                onDisconnect={() => {
+                  const isLastItemOnPage = projects.length === 1;
+                  const nextPage = isLastItemOnPage && currentPage > 1 ? currentPage - 1 : currentPage;
+                  fetchProjects(nextPage);
+                }}
+              />
+            ))}
+          </div>
+
+          {/* Pagination Controls */}
+          {totalPages > 1 && (
+            <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-6 mt-2 border-t border-zinc-800/80">
+              <p className="text-sm text-zinc-400">
+                Showing <span className="font-semibold text-white">{Math.min((currentPage - 1) * 5 + 1, totalProjects)}</span> to{" "}
+                <span className="font-semibold text-white">{Math.min(currentPage * 5, totalProjects)}</span> of{" "}
+                <span className="font-semibold text-white">{totalProjects}</span> projects
+              </p>
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => currentPage > 1 && fetchProjects(currentPage - 1)}
+                  disabled={currentPage === 1}
+                  className="p-2 bg-zinc-900/50 border border-zinc-800 hover:border-zinc-700 hover:bg-zinc-800/50 text-zinc-400 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed rounded-xl transition-all"
+                  title="Previous Page"
+                >
+                  <ChevronLeft className="w-5 h-5" />
+                </button>
+
+                {(() => {
+                  const pages: (number | string)[] = [];
+                  const maxVisible = 5;
+
+                  if (totalPages <= maxVisible) {
+                    for (let i = 1; i <= totalPages; i++) pages.push(i);
+                  } else {
+                    if (currentPage <= 3) {
+                      pages.push(1, 2, 3, 4, '...', totalPages);
+                    } else if (currentPage >= totalPages - 2) {
+                      pages.push(1, '...', totalPages - 3, totalPages - 2, totalPages - 1, totalPages);
+                    } else {
+                      pages.push(1, '...', currentPage - 1, currentPage, currentPage + 1, '...', totalPages);
+                    }
+                  }
+
+                  return pages.map((page, index) => {
+                    if (page === '...') {
+                      return (
+                        <span key={`dots-${index}`} className="w-10 h-10 flex items-center justify-center text-zinc-500 select-none">
+                          ...
+                        </span>
+                      );
+                    }
+                    return (
+                      <button
+                        key={page}
+                        onClick={() => fetchProjects(Number(page))}
+                        className={`w-10 h-10 flex items-center justify-center font-medium rounded-xl border transition-all ${
+                          currentPage === page
+                            ? "bg-red-500 border-red-500 text-white shadow-lg shadow-red-500/20"
+                            : "bg-zinc-900/50 border-zinc-800 hover:border-zinc-700 hover:bg-zinc-800/50 text-zinc-400 hover:text-white"
+                        }`}
+                      >
+                        {page}
+                      </button>
+                    );
+                  });
+                })()}
+
+                <button
+                  onClick={() => currentPage < totalPages && fetchProjects(currentPage + 1)}
+                  disabled={currentPage === totalPages}
+                  className="p-2 bg-zinc-900/50 border border-zinc-800 hover:border-zinc-700 hover:bg-zinc-800/50 text-zinc-400 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed rounded-xl transition-all"
+                  title="Next Page"
+                >
+                  <ChevronRight className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -26,10 +26,14 @@ const INDEX_FILES = JS_TS_EXTENSIONS.map((ext) => `index${ext}`);
 
 const PY_EXTENSIONS = [".py", ".pyi"];
 
-/** Every source extension whose imports this engine can parse. */
-export const SOURCE_EXTENSIONS = [...JS_TS_EXTENSIONS, ...PY_EXTENSIONS];
+const GO_EXTENSIONS = [".go"];
 
-export type SourceLanguage = "js" | "py";
+const JAVA_EXTENSIONS = [".java"];
+
+/** Every source extension whose imports this engine can parse. */
+export const SOURCE_EXTENSIONS = [...JS_TS_EXTENSIONS, ...PY_EXTENSIONS, ...GO_EXTENSIONS, ...JAVA_EXTENSIONS];
+
+export type SourceLanguage = "js" | "py" | "go" | "java";
 
 /** A single edge: `from` imports `to`. */
 export interface DependencyEdge {
@@ -74,6 +78,8 @@ export interface PrImpactReport {
 export function detectSourceLanguage(path: string): SourceLanguage | null {
   if (JS_TS_EXTENSIONS.some((ext) => path.endsWith(ext))) return "js";
   if (PY_EXTENSIONS.some((ext) => path.endsWith(ext))) return "py";
+  if (GO_EXTENSIONS.some((ext) => path.endsWith(ext))) return "go";
+  if (JAVA_EXTENSIONS.some((ext) => path.endsWith(ext))) return "java";
   return null;
 }
 
@@ -357,6 +363,180 @@ export function resolvePythonImport(
   return [...results];
 }
 
+// ---------------------------------------------------------------------------
+// Go import support
+// ---------------------------------------------------------------------------
+
+/** Remove Go block and line comments so commented-out or paren-bearing
+ *  comments don't corrupt import parsing. Not string-aware (consistent with
+ *  the other best-effort extractors); import paths never contain `//`. */
+function stripGoComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
+}
+
+/**
+ * Extract the imported package paths from Go source. Handles single-line
+ * imports (`import "fmt"`, `import alias "path"`, `import _ "path"`,
+ * `import . "path"`) and grouped blocks (`import ( ... )`). Only the quoted
+ * import path is captured; the alias/blank/dot qualifier is irrelevant to the
+ * dependency edge (it still pulls in the package).
+ */
+export function extractGoImports(source: string): string[] {
+  const text = stripGoComments(source);
+  const paths: string[] = [];
+  // Match both double-quoted and backtick (raw string) import paths.
+  // Backtick imports are valid Go (raw_string_lit) though rare in practice.
+  const specRe = /(?:[A-Za-z_]\w*\s+|_\s+|\.\s+)?(?:"([^"]+)"|`([^`]+)`)/g;
+
+  // Grouped: import ( ... )
+  const groupRe = /\bimport\s*\(([\s\S]*?)\)/g;
+  let gm: RegExpExecArray | null;
+  while ((gm = groupRe.exec(text)) !== null) {
+    const block = gm[1];
+    specRe.lastIndex = 0;
+    let sm: RegExpExecArray | null;
+    while ((sm = specRe.exec(block)) !== null) paths.push(sm[1] ?? sm[2]);
+  }
+
+  // Single-line: import [alias|_|.] "path" or `path`
+  const singleRe = /\bimport\s+(?:[A-Za-z_]\w*\s+|_\s+|\.\s+)?(?:"([^"]+)"|`([^`]+)`)/g;
+  let m: RegExpExecArray | null;
+  while ((m = singleRe.exec(text)) !== null) paths.push(m[1] ?? m[2]);
+
+  return paths;
+}
+
+/** Map each repo directory containing non-test `.go` files to those files. */
+function collectGoPackageDirs(fileSet: Set<string>): Map<string, string[]> {
+  const dirs = new Map<string, string[]>();
+  for (const path of fileSet) {
+    if (!path.endsWith(".go") || path.endsWith("_test.go")) continue;
+    const dir = dirOf(path);
+    const list = dirs.get(dir);
+    if (list) list.push(path);
+    else dirs.set(dir, [path]);
+  }
+  return dirs;
+}
+
+/** Parse the `module` path from a go.mod file in the set, if one is present. */
+function parseGoModulePath(files: Array<{ path: string; content: string }>): string | undefined {
+  const mod = files.find((f) => f.path === "go.mod" || f.path.endsWith("/go.mod"));
+  if (!mod) return undefined;
+  const m = /^\s*module\s+(\S+)/m.exec(mod.content);
+  return m ? m[1] : undefined;
+}
+
+/**
+ * Resolve a Go import path to the repo files it references. Go imports a
+ * *package* (a directory), so the edge points at every non-test `.go` file in
+ * that package directory.
+ *
+ * The in-repo package directory is always a trailing segment of the full
+ * import path — the module-path prefix declared in go.mod maps to the repo
+ * root. So we match the longest known package directory that is a suffix of
+ * the import path. When `modulePath` is supplied and the import falls under it,
+ * the prefix is stripped directly for an exact, unambiguous match. Standard
+ * library and external imports resolve to nothing (no repo directory matches).
+ */
+export function resolveGoImport(
+  importPath: string,
+  goDirs: Map<string, string[]>,
+  modulePath?: string
+): string[] {
+  if (modulePath) {
+    // Module path is known: only resolve imports that start with it.
+    // Imports that don't start with it are external packages — no edge.
+    if (importPath === modulePath || importPath.startsWith(modulePath + "/")) {
+      const rel = importPath === modulePath ? "" : importPath.slice(modulePath.length + 1);
+      return goDirs.get(rel) ?? [];
+    }
+    return [];
+  }
+
+  // No module path: suffix matching (best-effort). External imports that happen
+  // to share a trailing segment with an in-repo directory may produce false
+  // edges — resolved precisely only when modulePath is available.
+  // Note: root-package imports (dir "") cannot be resolved without modulePath.
+  let best: string | null = null;
+  for (const dir of goDirs.keys()) {
+    if (dir === "") continue; // root package requires exact modulePath match
+    if (importPath === dir || importPath.endsWith("/" + dir)) {
+      if (best === null || dir.length > best.length) best = dir;
+    }
+  }
+  return best !== null ? goDirs.get(best) ?? [] : [];
+}
+
+// ---------------------------------------------------------------------------
+// Java import support
+// ---------------------------------------------------------------------------
+
+export interface JavaImport {
+  /** Dotted fully-qualified name of the imported type (member/`*` stripped). */
+  fqn: string;
+  /** True for a package wildcard (`import a.b.*;`) → resolves to a directory. */
+  packageWildcard: boolean;
+}
+
+/**
+ * Extract Java imports. Handles ordinary type imports (`import a.b.C;`), package
+ * wildcards (`import a.b.*;`), and static imports (`import static a.b.C.m;`,
+ * `import static a.b.C.*;`). A static import targets a member of a type, so its
+ * type FQN is resolved (the trailing member or `*` is dropped). A non-static
+ * wildcard is a package import and resolves to a directory.
+ */
+export function extractJavaImports(source: string): JavaImport[] {
+  const out: JavaImport[] = [];
+  const re = /^\s*import\s+(static\s+)?([A-Za-z_$][\w$.]*?)(\.\*)?\s*;/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    const isStatic = Boolean(m[1]);
+    const wildcard = Boolean(m[3]);
+    let fqn = m[2];
+    // `import static a.b.C.member;` → the type is everything but the member.
+    if (isStatic && !wildcard) {
+      const dot = fqn.lastIndexOf(".");
+      if (dot > 0) fqn = fqn.slice(0, dot);
+    }
+    out.push({ fqn, packageWildcard: wildcard && !isStatic });
+  }
+  return out;
+}
+
+/**
+ * Resolve a Java import to the repo file(s) it references via the
+ * package→directory convention. The FQN path is always a suffix of the actual
+ * file path (the source root — `src/main/java`, `src/test/java`, `src`, … — is
+ * a prefix), so this matches by suffix and is therefore source-root agnostic
+ * with zero configuration.
+ *
+ * - Package wildcard → every `.java` file directly in the matching package dir.
+ * - Type import (incl. static member / static wildcard) → the single class file,
+ *   matching the longest FQN prefix that resolves to a file so nested classes
+ *   and static members map to their enclosing top-level class file.
+ *
+ * Standard-library and third-party imports match no repo file and yield no edge.
+ */
+export function resolveJavaImport(imp: JavaImport, javaFiles: string[]): string[] {
+  if (imp.packageWildcard) {
+    const pkgPath = imp.fqn.split(".").filter(Boolean).join("/");
+    if (!pkgPath) return [];
+    return javaFiles.filter((f) => {
+      const d = dirOf(f);
+      return d === pkgPath || d.endsWith("/" + pkgPath);
+    });
+  }
+
+  const parts = imp.fqn.split(".").filter(Boolean);
+  for (let len = parts.length; len >= 1; len--) {
+    const suffix = parts.slice(0, len).join("/") + ".java";
+    const hit = javaFiles.find((f) => f === suffix || f.endsWith("/" + suffix));
+    if (hit) return [hit];
+  }
+  return [];
+}
+
 /**
  * Build a dependency graph from a list of files and their contents.
  *
@@ -372,6 +552,13 @@ export function buildDependencyGraph(
   const fileSet = new Set(files.map((f) => f.path));
   const imports = new Map<string, Set<string>>();
   const importedBy = new Map<string, Set<string>>();
+
+  // Precompute Go package directories and module path once for the whole graph.
+  const goDirs = collectGoPackageDirs(fileSet);
+  const goModulePath = parseGoModulePath(files);
+
+  // Precompute Java file list once for the whole graph.
+  const javaFiles = [...fileSet].filter((f) => f.endsWith(".java"));
 
   for (const path of fileSet) {
     imports.set(path, new Set());
@@ -391,6 +578,18 @@ export function buildDependencyGraph(
     } else if (lang === "py") {
       for (const imp of extractPythonImports(file.content)) {
         for (const resolved of resolvePythonImport(file.path, imp, fileSet, pythonRoots)) {
+          resolvedPaths.push(resolved);
+        }
+      }
+    } else if (lang === "go") {
+      for (const spec of extractGoImports(file.content)) {
+        for (const resolved of resolveGoImport(spec, goDirs, goModulePath)) {
+          resolvedPaths.push(resolved);
+        }
+      }
+    } else if (lang === "java") {
+      for (const imp of extractJavaImports(file.content)) {
+        for (const resolved of resolveJavaImport(imp, javaFiles)) {
           resolvedPaths.push(resolved);
         }
       }

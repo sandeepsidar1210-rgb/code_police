@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import Image from 'next/image';
 
 const footerLinks = {
   product: [
@@ -30,21 +31,27 @@ export default function Footer() {
   const currentYear = new Date().getFullYear();
 
   return (
-    <footer className="bg-zinc-50 dark:bg-zinc-950 border-t border-zinc-200 dark:border-zinc-800">
+    <footer className="bg-neutral-950 border-t border-neutral-800">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
         <div className="grid grid-cols-2 md:grid-cols-4 gap-8">
           {/* Brand */}
           <div className="col-span-2 md:col-span-1">
             <Link href="/" className="flex items-center gap-2 mb-4">
-              <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-violet-600 to-indigo-600 flex items-center justify-center">
-                <span className="text-white font-bold text-sm">G</span>
-              </div>
-              <span className="text-xl font-bold bg-gradient-to-r from-violet-600 to-indigo-600 bg-clip-text text-transparent">
-                GhostHunter
+              <Image
+                src="/zero3.png"
+                alt="Code-Police Logo"
+                width={32}
+                height={32}
+                className="rounded-lg"
+                unoptimized
+              />
+              <span className="text-lg font-heading font-bold bg-gradient-to-r from-violet-400 to-cyan-400 bg-clip-text text-transparent">
+                Code-Police
               </span>
             </Link>
-            <p className="text-sm text-zinc-600 dark:text-zinc-400 mb-4">
-              Building the future of digital experiences, one pixel at a time.
+            <p className="text-sm text-neutral-500 mb-4">
+              AI-powered code review for open source. Automated security scanning,
+              performance analysis, and auto-fix PRs.
             </p>
             <div className="flex gap-4">
               {socialLinks.map((link) => (
@@ -53,7 +60,7 @@ export default function Footer() {
                   href={link.href}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-zinc-500 hover:text-zinc-900 dark:hover:text-white transition-colors"
+                  className="text-neutral-600 hover:text-neutral-300 transition-colors"
                   aria-label={link.label}
                 >
                   <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
@@ -66,13 +73,13 @@ export default function Footer() {
 
           {/* Product Links */}
           <div>
-            <h3 className="text-sm font-semibold text-zinc-900 dark:text-white mb-4">Product</h3>
+            <h3 className="text-sm font-semibold text-white mb-4">Product</h3>
             <ul className="space-y-3">
               {footerLinks.product.map((link) => (
                 <li key={link.href}>
                   <Link
                     href={link.href}
-                    className="text-sm text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white transition-colors"
+                    className="text-sm text-neutral-500 hover:text-neutral-300 transition-colors"
                   >
                     {link.label}
                   </Link>
@@ -83,13 +90,13 @@ export default function Footer() {
 
           {/* Company Links */}
           <div>
-            <h3 className="text-sm font-semibold text-zinc-900 dark:text-white mb-4">Company</h3>
+            <h3 className="text-sm font-semibold text-white mb-4">Company</h3>
             <ul className="space-y-3">
               {footerLinks.company.map((link) => (
                 <li key={link.href}>
                   <Link
                     href={link.href}
-                    className="text-sm text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white transition-colors"
+                    className="text-sm text-neutral-500 hover:text-neutral-300 transition-colors"
                   >
                     {link.label}
                   </Link>
@@ -100,13 +107,13 @@ export default function Footer() {
 
           {/* Legal Links */}
           <div>
-            <h3 className="text-sm font-semibold text-zinc-900 dark:text-white mb-4">Legal</h3>
+            <h3 className="text-sm font-semibold text-white mb-4">Legal</h3>
             <ul className="space-y-3">
               {footerLinks.legal.map((link) => (
                 <li key={link.href}>
                   <Link
                     href={link.href}
-                    className="text-sm text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white transition-colors"
+                    className="text-sm text-neutral-500 hover:text-neutral-300 transition-colors"
                   >
                     {link.label}
                   </Link>
@@ -117,9 +124,9 @@ export default function Footer() {
         </div>
 
         {/* Copyright */}
-        <div className="mt-12 pt-8 border-t border-zinc-200 dark:border-zinc-800">
-          <p className="text-sm text-center text-zinc-500">
-            © {currentYear} GhostHunter. All rights reserved.
+        <div className="mt-12 pt-8 border-t border-neutral-800">
+          <p className="text-sm text-center text-neutral-600">
+            © {currentYear} Code-Police. All rights reserved.
           </p>
         </div>
       </div>
